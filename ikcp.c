@@ -685,6 +685,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 		return;
 	}
 
+	//prev是sn最大的一个
 	for (p = kcp->rcv_buf.prev; p != &kcp->rcv_buf; p = prev) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		prev = p->prev;
@@ -692,6 +693,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 			repeat = 1;
 			break;
 		}
+		//newseg大于p->prev，小于p，所以newseg应该挂在p->next
 		if (_itimediff(sn, seg->sn) > 0) {
 			break;
 		}
@@ -934,6 +936,7 @@ void ikcp_flush(ikcpcb *kcp)
 	seg.ts = 0;
 
 	// flush acknowledges
+	// 在收到数据时，每个数据都会推送一个ack到kcp->acklist中，并使得ackcount++
 	count = kcp->ackcount;
 	for (i = 0; i < count; i++) {
 		size = (int)(ptr - buffer);
@@ -970,6 +973,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// flush window probing commands
+	// 发一个包要求扩大窗口
 	if (kcp->probe & IKCP_ASK_SEND) {
 		seg.cmd = IKCP_CMD_WASK;
 		size = (int)(ptr - buffer);
@@ -981,6 +985,9 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// flush window probing commands
+	// 看ikcp_input和ikcp_recv
+	// 在收到IKCP_CMD_WASK时会设置这个值
+	// 在快速恢复的时候也会设置
 	if (kcp->probe & IKCP_ASK_TELL) {
 		seg.cmd = IKCP_CMD_WINS;
 		size = (int)(ptr - buffer);
@@ -1030,12 +1037,14 @@ void ikcp_flush(ikcpcb *kcp)
 		IKCPSEG *segment = iqueue_entry(p, IKCPSEG, node);
 		int needsend = 0;
 		if (segment->xmit == 0) {
+			//第一次传输
 			needsend = 1;
 			segment->xmit++;
 			segment->rto = kcp->rx_rto;
 			segment->resendts = current + segment->rto + rtomin;
 		}
 		else if (_itimediff(current, segment->resendts) >= 0) {
+			//大于重传时间
 			needsend = 1;
 			segment->xmit++;
 			kcp->xmit++;
@@ -1048,6 +1057,9 @@ void ikcp_flush(ikcpcb *kcp)
 			lost = 1;
 		}
 		else if (segment->fastack >= resent) {
+			//快速重传
+			//见ikcp_parse_fastack，每一个被跳过确认的ack会导致fastack++
+			//用于判断乱序和丢包
 			needsend = 1;
 			segment->xmit++;
 			segment->fastack = 0;
@@ -1055,6 +1067,7 @@ void ikcp_flush(ikcpcb *kcp)
 			change++;
 		}
 
+		//发包
 		if (needsend) {
 			int size, need;
 			segment->ts = current;

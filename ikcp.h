@@ -16,6 +16,32 @@
 #include <stdlib.h>
 #include <assert.h>
 
+/*
+建议不使用ikcp，原因：
+一，实现思路和我们的需求不一样
+ikcp是面向字节流的，必须保证每个字节都传到；
+我们要求实时数据，每xx毫秒若干帧数据，优先发下一个时间片要播放的数据。之前的数据能重传则重传，如果已经过了播放时间则直接丢弃。
+如果用ikcp，则遇到丢包，乱序的情况就会导致随着连线时间，延时累积增大。
+因为涉及整个实现方案，所以改ikcp来做实时传输工作量也不小，而且代码会比较纠结。
+
+二，ikcp代码写的很蛋疼，虽然没有发现明显bug，但是有很多性能低下/代码不合理的地方。
+1 官方文档描述kcp优势时，主要理由包括：tcp没有sack功能，快速重传，nodelay所以性能不行，其实tcp都有
+  其实kcp的主要优势是加大了拥塞窗口，加快了重传。前者通过改/proc/下的tcp参数也能有类似的效果。不知道作者在测延时对比的时候是否有优化tcp默认参数。
+  因为kcp是应用程序，受进程调度周期的影响，会附带上更大的延时，这一点作者也没有做过分析和评测
+2 没有任何对数据包头格式，传输协议的描述。代码几乎无注释
+3 send时不会立即触发发包，只能通过调用ikcp_update触发，ikcp_update里面又设置了最短触发时间（代码写死最小不能小于10ms）
+  这里就额外引入了10ms延时。再加上应用程序调度有延时，在机器负载较高时，还会引入更多的延时
+  send应该有一个触发立即发包的机制，“小数据包合并发送”可以作为一个附加机制，而不是要求所有数据包都延迟发送尝试合并
+4 所有数据包不挂定时器，而是需要我们定时遍历所有socket的所有收发包队列判断是否要触发超时......当非活跃连接较多时性能会差一个数量级
+  估计这也是限制ikcp_flush最小10ms的原因
+5 发包时需要从外层buff拷贝到包buff，再拷贝到发送buff，额外增加了两次拷贝，影响性能
+6 协议设计采用'每个协议包只干自己的事'，然后'一个底层包可以发多个协议包'的方式。一般设计的好的协议会做成'一个协议包可以干多件事'
+  例如要发10个ack，在kcp里面要发10个ack包（可合并到一个底层包）；而设计良好时应该是一个kcp包就带了10个ack，以及在数据包里顺手就把ack捎回去了
+7 很奇怪为什么不用ntoh做大小端转码
+
+ */
+
+
 
 //=====================================================================
 // 32BIT INTEGER DEFINITION 
@@ -279,28 +305,52 @@ struct IKCPCB
 {
 	IUINT32 conv, mtu, mss, state;
 	IUINT32 snd_una, snd_nxt, rcv_nxt;
+	//snd_nxt 下一个要发送的序列号
+	//snd_una 已确认序列号
+	//rcv_nxt 下一个满足序列号，要收的包
 	IUINT32 ts_recent, ts_lastack, ssthresh;
+	//ssthresh 慢启动阈值，控制cwnd是快速增长还是慢增长
+	//ts_recent 完全没有用到，逗你玩的变量
+	//ts_lastack 同上
 	IINT32 rx_rttval, rx_srtt, rx_rto, rx_minrto;
+	//rx_rto 控制重传时间，标准算法是rx_srtt + rx_rttval，这里用的是rx_srtt + max(1, rx_rttval)
+	//假设网络延迟服从正态分布，这里接近50%都需要重传
+	//rx_rttval 平滑后的偏差时间
+	//rx_srtt 平滑后的rtt
 	IUINT32 snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe;
+	//rmt_wnd 对端接收窗口，满了就不能再发包了，会向对端发一个请求扩大窗口的包
+	//snd_wnd 发送窗口，限制一次ikcp_flush不要发太多了，并没有什么用的东西
+	//rcv_wnd 接收窗口，rcv_queue只能保持这么大，不然就要放在rcv_buf中，完全没有任何好处的东西
+	//cwnd 拥塞窗口，每次收到包++，我操增长这么慢；
+	//在触发了快速重传，cwnd会追加上fastresend的大小1
 	IUINT32 current, interval, ts_flush, xmit;
+	//xmit 重传次数，仅用于统计
+	//current 最后一次调ikcp_update的时间
+	//ts_flush 在这个时间点之后才能ikcp_flush
+	//interval 触发ts_flush的时间间隔，最短10毫秒
 	IUINT32 nrcv_buf, nsnd_buf;
+	//nrcv_buf 残留在rcv_buf的包数量
+	//nsnd_buf 残留在snd_buf的包数量
 	IUINT32 nrcv_que, nsnd_que;
+	//nrcv_que 残留在rcv_queue的包数量
+	//nsnd_que 残留在snd_queue的包数量
 	IUINT32 nodelay, updated;
-	IUINT32 ts_probe, probe_wait;
+	//updated 是否第一次触发ikcp_flush
+	IUINT32 ts_probe, probe_wait;	//ts_probe发送窗口扩大请求的时间；probe_wait需要等待多久才发送，每次发送之后会按1.5倍增长。下次需要发送时重置
 	IUINT32 dead_link, incr;
-	struct IQUEUEHEAD snd_queue;
-	struct IQUEUEHEAD rcv_queue;
-	struct IQUEUEHEAD snd_buf;
-	struct IQUEUEHEAD rcv_buf;
-	IUINT32 *acklist;
-	IUINT32 ackcount;
-	IUINT32 ackblock;
+	struct IQUEUEHEAD snd_queue;	//待发送的数据，只存了原始数据没有构造完整包头；在ikcp_flush中会把满足各种窗口的包扔到snd_buf里面
+	struct IQUEUEHEAD rcv_queue;	//收到的数据包，并且已经排序成功没有空洞的挂在这里
+	struct IQUEUEHEAD snd_buf;		//构造好了包头，满足滑动缓冲区的数据包。只要进了这里就不会管拥塞等了，每次ikcp_flush会遍历这里所有包，没法直接发，有发的判断重传等
+	struct IQUEUEHEAD rcv_buf;		//收到的数据包先存在这里
+	IUINT32 *acklist;				//待回复的ack，最后会把每个ack构造成完成协议包；但是会把多个协议包合并在一个udp中发出.....
+	IUINT32 ackcount;				//待回复ack数量
+	IUINT32 ackblock;				//acklist大小
 	void *user;
-	char *buffer;
+	char *buffer;					//发包时用的缓冲区，在这里构造要发的数据包，然后调发送函数
 	int fastresend;
 	int nocwnd, stream;
 	int logmask;
-	int (*output)(const char *buf, int len, struct IKCPCB *kcp, void *user);
+	int (*output)(const char *buf, int len, struct IKCPCB *kcp, void *user);	//发送函数
 	void (*writelog)(const char *log, struct IKCPCB *kcp, void *user);
 };
 
